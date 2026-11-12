@@ -52,6 +52,11 @@ const cleanType = (t, fb = 'other') => { const s = String(t || '').toLowerCase()
 const cleanColor = (c) => (/^#[0-9a-f]{6}$/i.test(String(c)) ? String(c).toLowerCase() : null);
 const cleanTransform = (t) => ({ x: num(t?.x), z: num(t?.z), rot: num(t?.rot) });
 const cleanBounds = (b) => ({ min: vec3(b?.min, [-2, 0, -2]), max: vec3(b?.max, [2, 2.6, 2]) });
+const cleanAlign = (a) => ({
+  fov: clamp(num(a?.fov), -30, 30), yaw: clamp(num(a?.yaw), -20, 20), pitch: clamp(num(a?.pitch), -20, 20), roll: clamp(num(a?.roll), -20, 20),
+  x: clamp(num(a?.x), -0.3, 0.3), y: clamp(num(a?.y), -0.3, 0.3), z: clamp(num(a?.z), -0.3, 0.3),
+});
+const MAX_POSED = 40, MAX_PHONE = 8;
 const cleanPose = (p) => (p && Array.isArray(p.p) && Array.isArray(p.q) && p.q.length === 4 ? { p: vec3(p.p), q: p.q.map((v) => num(v)) } : null);
 function cleanSize(s, type) {
   const d = DEFAULT_SIZE[type] || DEFAULT_SIZE.other;
@@ -184,6 +189,7 @@ app.get('/api/houses/:id', auth, wrap(async (req, res) => {
     const heavy = await readJSON(roomFile(h.id, r.id), {});
     r.mesh = heavy.mesh || null;
     r.photoCount = (heavy.photos || []).length;
+    r.posedPhotos = (heavy.photos || []).filter((p) => p.pose).length;
   }
   delete h.owner;
   res.json(h);
@@ -219,15 +225,15 @@ app.post('/api/houses/:id/rooms', auth, wrap(async (req, res) => {
       id: crypto.randomUUID(), name: clean(b.name, 40) || `Room ${h.rooms.length + 1}`, createdAt: Date.now(),
       bounds, transform: nextTransform(h, bounds), planes: cleanPlanes(b.planes), objects: cleanObjects(b.objects), ai: null,
     };
-    const photos = (Array.isArray(b.photos) ? b.photos : []).slice(-8)
+    const photos = (Array.isArray(b.photos) ? b.photos : []).slice(-MAX_POSED)
       .filter((p) => typeof p?.data === 'string' && p.data.length < 3e6)
-      .map((p) => ({ data: p.data, pose: cleanPose(p.pose), hfov: num(p.hfov, 72), aspect: num(p.aspect, 4 / 3) }));
+      .map((p) => ({ data: p.data, pose: cleanPose(p.pose), hfov: num(p.hfov, 76), aspect: num(p.aspect, 4 / 3) }));
     const mesh = typeof b.mesh?.positions === 'string' && typeof b.mesh?.indices === 'string' ? { positions: b.mesh.positions, indices: b.mesh.indices } : null;
     await writeJSON(roomFile(h.id, room.id), { mesh, photos });
     h.rooms.push(room);
     h.updatedAt = Date.now();
     await writeJSON(houseFile(h.id), h);
-    return { ...room, photoCount: photos.length };
+    return { ...room, photoCount: photos.length, posedPhotos: photos.filter((p) => p.pose).length };
   });
   if (out) res.json(out);
 }));
@@ -250,6 +256,7 @@ app.patch('/api/houses/:id/rooms/:rid', auth, wrap(async (req, res) => {
     if (b.name) room.name = clean(b.name, 40);
     if (Array.isArray(b.objects)) room.objects = cleanObjects(b.objects);
     if (b.transform) room.transform = cleanTransform(b.transform);
+    if (b.photoAlign) room.photoAlign = cleanAlign(b.photoAlign);
     return room;
   });
   if (out) res.json(out);
@@ -271,11 +278,23 @@ app.post('/api/houses/:id/rooms/:rid/photos', auth, wrap(async (req, res) => {
   const out = await editRoom(req, res, async (h, room) => {
     const f = roomFile(h.id, room.id);
     const heavy = await readJSON(f, {});
-    heavy.photos = [...(heavy.photos || []), ...images.map((data) => ({ data, pose: null }))].slice(-8);
+    const all = heavy.photos || [];
+    const phone = [...all.filter((p) => !p.pose), ...images.map((data) => ({ data, pose: null }))].slice(-MAX_PHONE);
+    heavy.photos = [...all.filter((p) => p.pose), ...phone];
     await writeJSON(f, heavy);
     return { photoCount: heavy.photos.length };
   });
   if (out) res.json(out);
+}));
+
+// Headset photos (with camera position) used to paint the real room onto the scan
+app.get('/api/houses/:id/rooms/:rid/photos', auth, wrap(async (req, res) => {
+  const h = await getHouse(req, res); if (!h) return;
+  const room = h.rooms.find((r) => r.id === req.params.rid);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  const heavy = await readJSON(roomFile(h.id, room.id), {});
+  res.set('cache-control', 'private, max-age=3600');
+  res.json({ photos: (heavy.photos || []).filter((p) => p.pose).map((p) => ({ pose: p.pose, hfov: p.hfov || 76, aspect: p.aspect || 4 / 3, data: p.data })) });
 }));
 
 // ---------- Claude furniture detection ----------
@@ -319,7 +338,7 @@ function rotq(q, v) {
 }
 
 function placeFromPhoto(ex, ph, type, size, b) {
-  const tx = Math.tan(((ph.hfov || 72) * Math.PI) / 360), ty = tx / (ph.aspect || 4 / 3);
+  const tx = Math.tan(((ph.hfov || 76) * Math.PI) / 360), ty = tx / (ph.aspect || 4 / 3);
   let d = rotq(ph.pose.q, [(num(ex.u, 0.5) - 0.5) * 2 * tx, -(num(ex.v, 0.5) - 0.5) * 2 * ty, -1]);
   const len = Math.hypot(...d) || 1;
   d = d.map((c) => c / len);
@@ -386,13 +405,18 @@ app.post('/api/houses/:id/rooms/:rid/detect', auth, wrap(async (req, res) => {
   const room = h.rooms.find((r) => r.id === req.params.rid);
   if (!room) return res.status(404).json({ error: 'Room not found' });
   const heavy = await readJSON(roomFile(h.id, room.id), {});
-  const photos = (heavy.photos || []).slice(-8);
+  // up to 8 photos for Claude: headset photos spread around the room + the newest phone photos
+  const all = heavy.photos || [];
+  const posed = all.filter((p) => p.pose), phone = all.filter((p) => !p.pose).slice(-4);
+  const nPosed = Math.min(posed.length, 8 - phone.length);
+  const spread = nPosed <= 1 ? posed.slice(0, nPosed) : Array.from({ length: nPosed }, (_, i) => posed[Math.round((i * (posed.length - 1)) / (nPosed - 1))]);
+  const photos = [...spread, ...phone];
   const content = [];
   photos.forEach((ph, i) => {
     let info = `Photo ${i}: phone photo, no position info.`;
     if (ph.pose) {
       const fwd = rotq(ph.pose.q, [0, 0, -1]);
-      info = `Photo ${i}: headset camera at ${fv(ph.pose.p)} looking toward direction ${fv(fwd)}, horizontal FOV ≈ ${Math.round(ph.hfov || 72)}°.`;
+      info = `Photo ${i}: headset camera at ${fv(ph.pose.p)} looking toward direction ${fv(fwd)}, horizontal FOV ≈ ${Math.round(ph.hfov || 76)}°.`;
     }
     content.push({ type: 'text', text: info });
     content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: ph.data } });

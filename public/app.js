@@ -8,7 +8,7 @@ const $ = (s) => document.querySelector(s);
 const S = {
   token: localStorage.getItem('hs_token'), user: localStorage.getItem('hs_user'), config: {},
   houses: [], house: null, roomId: null, view: 'dollhouse', layoutDirty: false,
-  showLabels: true, showMesh: true, showModels: true, cutaway: true,
+  showPhotos: true, showLabels: true, showBoxes: true, showModels: false, cutaway: true,
   support: { ar: false, vr: false }, xrMode: null, scan: null, camStream: null, camVideo: null, hudForce: 0,
 };
 
@@ -152,8 +152,10 @@ new ResizeObserver(onResize).observe(viewport);
 
 const shared = (m) => { m.userData.shared = true; return m; };
 const MAT = {
-  floor: shared(new THREE.MeshStandardMaterial({ color: 0xc8b496, roughness: 0.9, side: THREE.DoubleSide })),
-  floorSel: shared(new THREE.MeshStandardMaterial({ color: 0x5fd6c6, roughness: 0.9, side: THREE.DoubleSide })),
+  floorHidden: shared(new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide })),
+  floorSel: shared(new THREE.MeshBasicMaterial({ color: 0x14b8a6, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide })),
+  box: shared(new THREE.LineBasicMaterial({ color: 0x2dd4bf })),
+  boxApprox: shared(new THREE.LineBasicMaterial({ color: 0xfbbf24 })),
   wall: shared(new THREE.MeshStandardMaterial({ color: 0xe9edf2, roughness: 0.95, side: THREE.DoubleSide })),
   ceiling: shared(new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 1, side: THREE.DoubleSide })),
   door: shared(new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.8, side: THREE.DoubleSide })),
@@ -321,68 +323,277 @@ function buildFurniture(o, bounds) {
 const roomGroups = new Map();
 const findRoom = (id) => S.house?.rooms.find((r) => r.id === id);
 
+// Everything you walk on/around comes from the real scan: the headset's room mesh (Quest 3/3S) or its
+// walls/floor/furniture boxes (Quest 2), painted with the photos taken during the scan.
+function pushSubdivided(out, a, b, c, maxLen, depth = 0) {
+  const ab = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]), bc = Math.hypot(b[0] - c[0], b[1] - c[1], b[2] - c[2]), ca = Math.hypot(c[0] - a[0], c[1] - a[1], c[2] - a[2]);
+  const m = Math.max(ab, bc, ca);
+  if (m <= maxLen || depth > 8) { out.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]); return; }
+  const mid = (p, q) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2];
+  if (m === ab) { const p = mid(a, b); pushSubdivided(out, a, p, c, maxLen, depth + 1); pushSubdivided(out, p, b, c, maxLen, depth + 1); }
+  else if (m === bc) { const p = mid(b, c); pushSubdivided(out, a, b, p, maxLen, depth + 1); pushSubdivided(out, a, p, c, maxLen, depth + 1); }
+  else { const p = mid(c, a); pushSubdivided(out, a, b, p, maxLen, depth + 1); pushSubdivided(out, p, b, c, maxLen, depth + 1); }
+}
+function pushGeometry(out, geo) {
+  const pos = geo.attributes.position.array, idx = geo.index ? geo.index.array : null, n = idx ? idx.length : pos.length / 3;
+  const v = (i) => { const k = (idx ? idx[i] : i) * 3; return [pos[k], pos[k + 1], pos[k + 2]]; };
+  for (let i = 0; i < n; i += 3) pushSubdivided(out, v(i), v(i + 1), v(i + 2), 0.45);
+}
+function surfaceGeometry(room) {
+  const out = [];
+  if (room.mesh?.positions) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(fromB64(room.mesh.positions, Float32Array), 3));
+    geo.setIndex(new THREE.BufferAttribute(fromB64(room.mesh.indices, Uint32Array), 1));
+    pushGeometry(out, geo);
+  } else {
+    for (const pl of room.planes || []) if (['wall', 'floor', 'ceiling'].includes(planeKind(pl.label))) pushGeometry(out, polygonGeometry(pl.points));
+    for (const o of room.objects || []) {
+      if (o.source !== 'quest' || !o.center) continue;
+      pushGeometry(out, new THREE.BoxGeometry(...o.size).rotateY(o.yaw || 0).translate(...o.center));
+    }
+    if (!out.length) { const b = room.bounds; pushGeometry(out, polygonGeometry([[b.min[0], 0, b.min[2]], [b.max[0], 0, b.min[2]], [b.max[0], 0, b.max[2]], [b.min[0], 0, b.max[2]]])); }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(out, 3));
+  geo.computeVertexNormals();
+  const n = out.length / 3, prect = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) prect[i * 4 + 2] = -1; // no photo yet
+  geo.setAttribute('pclip', new THREE.BufferAttribute(new Float32Array(n * 4), 4));
+  geo.setAttribute('prect', new THREE.BufferAttribute(prect, 4));
+  return geo;
+}
+
+function buildFurn(room) {
+  const fg = new THREE.Group(); const b = room.bounds;
+  const parts = { models: [], boxes: [], labels: [], roomLabel: null };
+  for (const o of room.objects || []) {
+    if (!o.center || !o.size) continue;
+    const f = buildFurniture(o, b); fg.add(f); parts.models.push(f);
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(...o.size)), o.approx ? MAT.boxApprox : MAT.box);
+    edges.position.set(...o.center); edges.rotation.y = o.yaw || 0; fg.add(edges); parts.boxes.push(edges);
+    const lbl = textSprite((o.approx ? '≈ ' : '') + (o.name || o.type), 0.085);
+    lbl.position.set(o.center[0], o.center[1] + o.size[1] / 2 + 0.12, o.center[2]); fg.add(lbl); parts.labels.push(lbl);
+  }
+  parts.roomLabel = textSprite(room.name, 0.2, 'rgba(13,148,136,0.92)'); parts.roomLabel.position.set(0, 1.95, 0); fg.add(parts.roomLabel);
+  fg.userData.parts = parts;
+  return fg;
+}
+
 function buildRoom(room) {
   const g = new THREE.Group(); g.userData.roomId = room.id;
   const t = room.transform || { x: 0, z: 0, rot: 0 };
   g.position.set(t.x, 0, t.z); g.rotation.y = t.rot || 0;
   const b = room.bounds;
-  const parts = { walls: [], ceilings: [], models: [], labels: [], mesh: null, roomLabel: null };
+  const parts = { surface: null, mat: roomMaterial(room), hasPhotos: false, extras: [], floor: null };
   const floors = (room.planes || []).filter((p) => planeKind(p.label) === 'floor').sort((a, c) => polyArea(c.points) - polyArea(a.points));
   const fpts = floors[0] ? floors[0].points.map((p) => [p[0], 0, p[2]]) : [[b.min[0], 0, b.min[2]], [b.max[0], 0, b.min[2]], [b.max[0], 0, b.max[2]], [b.min[0], 0, b.max[2]]];
-  const floor = new THREE.Mesh(polygonGeometry(fpts), MAT.floor);
-  floor.position.y = -0.006; floor.userData.floorOf = room.id; g.add(floor); g.userData.floor = floor;
-  for (const pl of room.planes || []) {
+  parts.floor = new THREE.Mesh(polygonGeometry(fpts), MAT.floorHidden); // used for clicking/teleporting + selection tint
+  parts.floor.position.y = 0.012; parts.floor.renderOrder = 2; parts.floor.userData.floorOf = room.id; g.add(parts.floor); g.userData.floor = parts.floor;
+  parts.surface = new THREE.Mesh(surfaceGeometry(room), parts.mat); g.add(parts.surface);
+  for (const pl of room.planes || []) { // doors/windows as coloured panels when photos are off
     const kind = planeKind(pl.label);
-    const mat = { wall: MAT.wall, ceiling: MAT.ceiling, door: MAT.door, window: MAT.window }[kind];
-    if (!mat) continue;
-    let pts = pl.points;
-    if (kind === 'door' || kind === 'window') { // nudge toward the room centre so it doesn't z-fight with the wall
-      const n = pl.normal || [0, 0, 0]; const p0 = pts[0];
-      const s = Math.sign(-p0[0] * n[0] - p0[2] * n[2]) || 1;
-      pts = pts.map((p) => [p[0] + n[0] * 0.015 * s, p[1], p[2] + n[2] * 0.015 * s]);
-    }
-    const m = new THREE.Mesh(polygonGeometry(pts), mat); g.add(m);
-    if (kind === 'wall') parts.walls.push(m);
-    if (kind === 'ceiling') parts.ceilings.push(m);
+    if (kind !== 'door' && kind !== 'window') continue;
+    const n = pl.normal || [0, 0, 0], p0 = pl.points[0], s = Math.sign(-p0[0] * n[0] - p0[2] * n[2]) || 1;
+    const m = new THREE.Mesh(polygonGeometry(pl.points.map((p) => [p[0] + n[0] * 0.015 * s, p[1], p[2] + n[2] * 0.015 * s])), kind === 'door' ? MAT.door : MAT.window);
+    g.add(m); parts.extras.push(m);
   }
-  if (room.mesh?.positions) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(fromB64(room.mesh.positions, Float32Array), 3));
-    geo.setIndex(new THREE.BufferAttribute(fromB64(room.mesh.indices, Uint32Array), 1));
-    geo.computeVertexNormals();
-    parts.mesh = new THREE.Mesh(geo, MAT.scan); g.add(parts.mesh);
-  }
-  for (const o of room.objects || []) {
-    if (!o.center || !o.size) continue;
-    const f = buildFurniture(o, b); g.add(f); parts.models.push(f);
-    const lbl = textSprite((o.approx ? '≈ ' : '') + (o.name || o.type), 0.085);
-    lbl.position.set(o.center[0], o.center[1] + o.size[1] / 2 + 0.12, o.center[2]); g.add(lbl); parts.labels.push(lbl);
-  }
-  parts.roomLabel = textSprite(room.name, 0.2, 'rgba(13,148,136,0.92)'); parts.roomLabel.position.set(0, 1.95, 0); g.add(parts.roomLabel);
   g.userData.parts = parts;
+  g.userData.furn = buildFurn(room); g.add(g.userData.furn);
   return g;
 }
-function addRoomGroup(room) { const g = buildRoom(room); roomGroups.set(room.id, g); houseRoot.add(g); }
+function addRoomGroup(room) { const g = buildRoom(room); roomGroups.set(room.id, g); houseRoot.add(g); if (room.posedPhotos) applyPhotos(room); }
 function buildHouse() {
   for (const g of roomGroups.values()) { houseRoot.remove(g); disposeTree(g); }
   roomGroups.clear();
+  for (const a of atlasCache.values()) a.tex.dispose();
+  atlasCache.clear(); photoCache.clear();
   for (const r of S.house.rooms) addRoomGroup(r);
   applyVisibility();
 }
-function rebuildRoom(room) { const old = roomGroups.get(room.id); if (old) { houseRoot.remove(old); disposeTree(old); } addRoomGroup(room); applyVisibility(); }
+function refreshFurniture(room) {
+  const g = roomGroups.get(room.id); if (!g) return;
+  g.remove(g.userData.furn); disposeTree(g.userData.furn);
+  g.userData.furn = buildFurn(room); g.add(g.userData.furn); applyVisibility();
+}
 function applyVisibility() {
   const walk = S.xrMode === 'walk' || (S.view === 'walk' && !S.xrMode);
   for (const [id, g] of roomGroups) {
-    const p = g.userData.parts; const meshOn = !!p.mesh && S.showMesh;
-    if (p.mesh) p.mesh.visible = S.showMesh;
-    p.walls.forEach((m) => (m.visible = !meshOn));
-    p.ceilings.forEach((m) => (m.visible = !meshOn && walk));
-    p.models.forEach((m) => (m.visible = S.showModels));
-    p.labels.forEach((m) => (m.visible = S.showModels && S.showLabels));
-    p.roomLabel.visible = !walk;
-    g.userData.floor.material = id === S.roomId && !walk ? MAT.floorSel : MAT.floor;
+    const p = g.userData.parts, f = g.userData.furn.userData.parts;
+    const photo = S.showPhotos && p.hasPhotos;
+    p.mat.uniforms.usePhotos.value = photo ? 1 : 0;
+    p.mat.uniforms.hideNear.value = walk ? 0 : 1;
+    p.extras.forEach((m) => (m.visible = !photo));
+    f.models.forEach((m) => (m.visible = S.showModels));
+    f.boxes.forEach((m) => (m.visible = S.showBoxes && !S.showModels));
+    f.labels.forEach((m) => (m.visible = S.showLabels));
+    f.roomLabel.visible = !walk;
+    p.floor.material = id === S.roomId && !walk ? MAT.floorSel : MAT.floorHidden;
   }
   renderer.clippingPlanes = !walk && S.cutaway && !S.xrMode ? [cutPlane] : [];
+}
+
+// ---------- real photos → scan (projective texturing with occlusion) ----------
+const photoCache = new Map(), atlasCache = new Map();
+const DW = 256, DH = 192, DMAX = 32;
+const depthRT = new THREE.WebGLRenderTarget(DW, DH);
+const distMat = new THREE.ShaderMaterial({
+  vertexShader: 'varying vec3 vView; void main() { vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+  fragmentShader: `varying vec3 vView; void main() { float d = clamp(length(vView) / ${DMAX.toFixed(1)}, 0.0, 0.9999);
+    vec3 e = fract(d * vec3(1.0, 255.0, 65025.0)); e.xy -= e.yz / 255.0; gl_FragColor = vec4(e, 1.0); }`,
+  side: THREE.DoubleSide,
+});
+function loadPhotos(room) {
+  if (!photoCache.has(room.id)) {
+    photoCache.set(room.id, api('GET', `/api/houses/${S.house.id}/rooms/${room.id}/photos`).then((r) => Promise.all(r.photos.map(async (p) => ({
+      ...p, data: undefined, bmp: await createImageBitmap(new Blob([fromB64(p.data, Uint8Array)], { type: 'image/jpeg' })),
+    })))).catch((e) => { photoCache.delete(room.id); throw e; }));
+  }
+  return photoCache.get(room.id);
+}
+function getAtlas(roomId, photos) {
+  if (atlasCache.has(roomId)) return atlasCache.get(roomId);
+  const n = photos.length, tw = n > 25 ? 512 : 640, th = (tw * 3) / 4;
+  const cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
+  const c = document.createElement('canvas'); c.width = cols * tw; c.height = rows * th; const ctx = c.getContext('2d');
+  const rects = photos.map((p, i) => {
+    const col = i % cols, row = Math.floor(i / cols);
+    ctx.drawImage(p.bmp, col * tw, row * th, tw, th);
+    return [(col * tw) / c.width, 1 - ((row + 1) * th) / c.height, tw / c.width, th / c.height];
+  });
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  const atlas = { tex, rects }; atlasCache.set(roomId, atlas);
+  return atlas;
+}
+const deg = THREE.MathUtils.degToRad;
+function photoCam(p, a = {}) {
+  const aspect = p.aspect || 4 / 3, hf = deg((p.hfov || 76) + (a.fov || 0));
+  const cam = new THREE.PerspectiveCamera(THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(hf / 2) / aspect)), aspect, 0.05, DMAX);
+  const q = new THREE.Quaternion().fromArray(p.pose.q);
+  cam.position.fromArray(p.pose.p).add(new THREE.Vector3(a.x || 0, a.y || 0, a.z || 0).applyQuaternion(q));
+  cam.quaternion.copy(q).multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(deg(a.pitch || 0), deg(a.yaw || 0), deg(a.roll || 0), 'YXZ')));
+  cam.updateProjectionMatrix(); cam.updateMatrixWorld(true);
+  cam.userData.vp = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse).elements;
+  return cam;
+}
+function depthMaps(geo, cams) {
+  const scene = new THREE.Scene(); scene.add(new THREE.Mesh(geo, distMat));
+  const prev = { xr: renderer.xr.enabled, clip: renderer.clippingPlanes, rt: renderer.getRenderTarget(), cc: renderer.getClearColor(new THREE.Color()), ca: renderer.getClearAlpha() };
+  renderer.xr.enabled = false; renderer.clippingPlanes = []; renderer.setClearColor(0xffffff, 1);
+  const buf = new Uint8Array(DW * DH * 4);
+  const maps = cams.map((cam) => {
+    renderer.setRenderTarget(depthRT); renderer.clear(); renderer.render(scene, cam);
+    renderer.readRenderTargetPixels(depthRT, 0, 0, DW, DH, buf);
+    const d = new Float32Array(DW * DH);
+    for (let i = 0; i < d.length; i++) d[i] = (buf[i * 4] / 255 + buf[i * 4 + 1] / 65025 + buf[i * 4 + 2] / 16581375) * DMAX;
+    return d;
+  });
+  renderer.setRenderTarget(prev.rt); renderer.xr.enabled = prev.xr; renderer.clippingPlanes = prev.clip; renderer.setClearColor(prev.cc, prev.ca);
+  return maps;
+}
+// For every little triangle of the scan, pick the photo that sees it best (in view, not hidden behind something, facing it, close).
+async function assignPhotos(geo, cams, depth, rects, isCurrent) {
+  const pos = geo.attributes.position.array, n = pos.length / 9;
+  const pclip = new Float32Array(n * 12), prect = new Float32Array(n * 12);
+  const vps = cams.map((c) => c.userData.vp), cps = cams.map((c) => c.position);
+  const c4 = [0, 0, 0, 0];
+  const proj = (e, x, y, z) => { c4[0] = e[0] * x + e[4] * y + e[8] * z + e[12]; c4[1] = e[1] * x + e[5] * y + e[9] * z + e[13]; c4[2] = e[2] * x + e[6] * y + e[10] * z + e[14]; c4[3] = e[3] * x + e[7] * y + e[11] * z + e[15]; };
+  for (let t = 0; t < n; t++) {
+    if (t && t % 4000 === 0) { await new Promise((r) => setTimeout(r)); if (!isCurrent()) return false; }
+    const o = t * 9;
+    const mx = (pos[o] + pos[o + 3] + pos[o + 6]) / 3, my = (pos[o + 1] + pos[o + 4] + pos[o + 7]) / 3, mz = (pos[o + 2] + pos[o + 5] + pos[o + 8]) / 3;
+    const ux = pos[o + 3] - pos[o], uy = pos[o + 4] - pos[o + 1], uz = pos[o + 5] - pos[o + 2], vx = pos[o + 6] - pos[o], vy = pos[o + 7] - pos[o + 1], vz = pos[o + 8] - pos[o + 2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx; const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+    let best = -1, bestS = 0;
+    for (let k = 0; k < vps.length; k++) {
+      const e = vps[k];
+      proj(e, mx, my, mz); if (c4[3] <= 0.05) continue;
+      const sx = c4[0] / c4[3], sy = c4[1] / c4[3];
+      if (sx < -0.98 || sx > 0.98 || sy < -0.98 || sy > 0.98) continue;
+      const cp = cps[k], dx = cp.x - mx, dy = cp.y - my, dz = cp.z - mz, dist = Math.hypot(dx, dy, dz);
+      const facing = Math.abs(nx * dx + ny * dy + nz * dz) / dist; if (facing < 0.25) continue;
+      const dk = depth[k];
+      const seen = (x, y, d) => d <= dk[clamp(((y * 0.5 + 0.5) * DH) | 0, 0, DH - 1) * DW + clamp(((x * 0.5 + 0.5) * DW) | 0, 0, DW - 1)] + 0.05 + d * 0.03;
+      if (!seen(sx, sy, dist)) continue; // something is in front of it in this photo
+      let inside = 1, behind = false, hidden = 0;
+      for (let v = 0; v < 3; v++) {
+        const px = pos[o + v * 3], py = pos[o + v * 3 + 1], pz = pos[o + v * 3 + 2];
+        proj(e, px, py, pz);
+        if (c4[3] <= 0.05) { behind = true; break; }
+        const vx2 = c4[0] / c4[3], vy2 = c4[1] / c4[3];
+        if (Math.abs(vx2) > 1 || Math.abs(vy2) > 1) { inside = 0.35; continue; }
+        if (!seen(vx2, vy2, Math.hypot(cp.x - px, cp.y - py, cp.z - pz))) hidden++;
+      }
+      if (behind) continue;
+      if (hidden) inside *= hidden === 1 ? 0.3 : 0.1; // partly hidden: only use it if nothing better
+      const s = (facing * (1 - 0.35 * (sx * sx + sy * sy)) * inside) / (0.6 + dist);
+      if (s > bestS) { bestS = s; best = k; }
+    }
+    for (let v = 0; v < 3; v++) {
+      const i = t * 12 + v * 4;
+      if (best < 0) { prect[i + 2] = -1; continue; }
+      proj(vps[best], pos[o + v * 3], pos[o + v * 3 + 1], pos[o + v * 3 + 2]);
+      pclip[i] = c4[0]; pclip[i + 1] = c4[1]; pclip[i + 2] = c4[2]; pclip[i + 3] = c4[3];
+      prect.set(rects[best], i);
+    }
+  }
+  geo.setAttribute('pclip', new THREE.BufferAttribute(pclip, 4));
+  geo.setAttribute('prect', new THREE.BufferAttribute(prect, 4));
+  return true;
+}
+function roomMaterial(room) {
+  const b = room.bounds;
+  return new THREE.ShaderMaterial({
+    uniforms: { atlas: { value: null }, usePhotos: { value: 0 }, hideNear: { value: 1 }, camLocal: { value: new THREE.Vector3(0, 50, 0) },
+      bmin: { value: new THREE.Vector2(b.min[0], b.min[2]) }, bmax: { value: new THREE.Vector2(b.max[0], b.max[2]) } },
+    vertexShader: `attribute vec4 pclip; attribute vec4 prect; varying vec4 vClip; varying vec4 vRect; varying vec3 vN; varying vec3 vLocal;
+      #include <common>
+      #include <clipping_planes_pars_vertex>
+      void main() {
+        vClip = pclip; vRect = prect; vN = normal; vLocal = position;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        #include <clipping_planes_vertex>
+      }`,
+    fragmentShader: `uniform sampler2D atlas; uniform float usePhotos; uniform float hideNear; uniform vec3 camLocal; uniform vec2 bmin; uniform vec2 bmax;
+      varying vec4 vClip; varying vec4 vRect; varying vec3 vN; varying vec3 vLocal;
+      #include <common>
+      #include <clipping_planes_pars_fragment>
+      void main() {
+        #include <clipping_planes_fragment>
+        vec3 n = normalize(vN);
+        if (hideNear > 0.5 && abs(n.y) < 0.6) { // dollhouse: hide walls on the side you're looking in from
+          float m = 0.15;
+          if ((vLocal.x > bmax.x - m && camLocal.x > bmax.x) || (vLocal.x < bmin.x + m && camLocal.x < bmin.x) ||
+              (vLocal.z > bmax.y - m && camLocal.z > bmax.y) || (vLocal.z < bmin.y + m && camLocal.z < bmin.y)) discard;
+        }
+        vec3 col = vec3(0.78, 0.76, 0.72) * (0.55 + 0.45 * abs(dot(n, normalize(vec3(0.35, 0.85, 0.4)))));
+        if (usePhotos > 0.5 && vRect.z > 0.0) {
+          vec2 uv = clamp(vClip.xy / vClip.w * 0.5 + 0.5, 0.003, 0.997);
+          col = texture2D(atlas, vRect.xy + uv * vRect.zw).rgb;
+        }
+        gl_FragColor = vec4(col, 1.0);
+        #include <colorspace_fragment>
+      }`,
+    side: THREE.DoubleSide, clipping: true,
+  });
+}
+async function applyPhotos(room) {
+  const g = roomGroups.get(room.id); if (!g) return;
+  const job = (g.userData.photoJob = {}); const isCurrent = () => roomGroups.get(room.id) === g && g.userData.photoJob === job;
+  let photos;
+  try { photos = await loadPhotos(room); } catch (e) { return toast('Photos: ' + e.message); }
+  if (!isCurrent() || !photos.length) return;
+  S.photoBusy = (S.photoBusy || 0) + 1; setPhotoStatus();
+  try {
+    const p = g.userData.parts, geo = p.surface.geometry;
+    const cams = photos.map((ph) => photoCam(ph, room.photoAlign));
+    const atlas = getAtlas(room.id, photos);
+    const ok = await assignPhotos(geo, cams, depthMaps(geo, cams), atlas.rects, isCurrent);
+    if (!ok || !isCurrent()) return;
+    p.mat.uniforms.atlas.value = atlas.tex; p.hasPhotos = true;
+    applyVisibility();
+  } finally { S.photoBusy--; setPhotoStatus(); }
 }
 const floorMeshes = () => [...roomGroups.values()].map((g) => g.userData.floor);
 function roomAt(pos) {
@@ -474,7 +685,7 @@ let saveTimer;
 function saveObjects(room) { clearTimeout(saveTimer); saveTimer = setTimeout(() => api('PATCH', `/api/houses/${S.house.id}/rooms/${room.id}`, { objects: room.objects }).catch((e) => toast(e.message)), 500); }
 function editObj(room, o, patch) {
   if (patch === null) room.objects = room.objects.filter((x) => x !== o); else Object.assign(o, patch);
-  rebuildRoom(room); saveObjects(room); if (patch === null || 'type' in patch) renderSide();
+  refreshFurniture(room); saveObjects(room); if (patch === null || 'type' in patch) renderSide();
 }
 function furnRow(room, o) {
   return h('div', { class: 'furn' + (o.approx ? ' approx' : ''), title: o.approx ? 'Position estimated by Claude from a photo' : o.label ? `Headset label: ${o.label}` : '' },
@@ -505,33 +716,63 @@ function renderSide() {
         h('button', { onclick: () => rot(-Math.PI / 36) }, '⟳ 5°'), h('button', { onclick: () => rot(-Math.PI / 2) }, '⟳ 90°'),
         h('button', { class: 'primary', disabled: !S.layoutDirty, onclick: saveLayout }, '💾 Save layout')));
     }
-    side.append(h('h4', {}, `Furniture (${room.objects.length})`));
-    if (!room.objects.length) side.append(h('p', { class: 'muted small' }, 'No furniture yet. Try “Detect again” or add photos so Claude can see the room.'));
+    side.append(h('h4', {}, `Real photos (${room.posedPhotos || 0})`));
+    if (!room.posedPhotos) side.append(h('p', { class: 'muted small' }, 'No headset photos for this room yet. Rescan it with “📷 Use headset camera” turned on and your real walls and furniture will show up here instead of grey.'));
+    else {
+      side.append(h('p', { id: 'photoStatus', class: 'muted small' }, photoStatusText()));
+      side.append(h('details', { open: !!S.alignOpen, ontoggle: (e) => (S.alignOpen = e.target.open) }, h('summary', { class: 'small' }, '🎯 Align photos (if they look shifted)'), alignControls(room)));
+    }
+    side.append(h('h4', {}, `Detected by Claude (${room.objects.length})`));
+    if (!room.objects.length) side.append(h('p', { class: 'muted small' }, 'Nothing detected yet. Try “Detect again” or add photos so Claude can see the room.'));
     for (const o of room.objects) side.append(furnRow(room, o));
   }
   const tog = (label, key) => h('label', {}, h('input', { type: 'checkbox', checked: S[key], onchange: (e) => { S[key] = e.target.checked; applyVisibility(); } }), label);
-  side.append(h('h4', {}, 'Show'), h('div', { class: 'toggles' }, tog('Furniture models', 'showModels'), tog('Labels', 'showLabels'), tog('Real scan mesh', 'showMesh'), tog('Cut away ceiling (dollhouse)', 'cutaway')));
+  side.append(h('h4', {}, 'Show'), h('div', { class: 'toggles' }, tog('Real photos on the scan', 'showPhotos'), tog('Detection boxes', 'showBoxes'), tog('Labels', 'showLabels'), tog('Claude 3D furniture models', 'showModels'), tog('Cut away ceiling (dollhouse)', 'cutaway')));
+}
+const photoStatusText = () => (S.photoBusy ? '🖼 Painting your photos onto the scan…' : '✅ Walls and furniture use your real photos.');
+function setPhotoStatus() { const el = document.getElementById('photoStatus'); if (el) el.textContent = photoStatusText(); }
+let realignTimer;
+function queueRealign(room) { clearTimeout(realignTimer); realignTimer = setTimeout(() => applyPhotos(room), 200); }
+async function saveAlign(room) {
+  try { await api('PATCH', `/api/houses/${S.house.id}/rooms/${room.id}`, { photoAlign: room.photoAlign }); toast('Alignment saved'); } catch (e) { toast(e.message); }
+}
+function alignControls(room) {
+  const a = (room.photoAlign = { fov: 0, yaw: 0, pitch: 0, roll: 0, x: 0, y: 0, z: 0, ...(room.photoAlign || {}) });
+  const row = (label, key, min, max, step, unit, scale = 1) => {
+    const fmt = () => (a[key] * scale).toFixed(unit === 'cm' ? 0 : 1) + unit;
+    const out = h('span', { class: 'muted small val' }, fmt());
+    return h('label', { class: 'slider' }, h('span', { class: 'small' }, label),
+      h('input', { type: 'range', min, max, step, value: a[key], oninput: (e) => { a[key] = +e.target.value; out.textContent = fmt(); queueRealign(room); } }), out);
+  };
+  return h('div', { class: 'align' },
+    h('p', { class: 'muted small' }, 'Turn on Walk view, look at a door frame or table edge, and nudge until the photo lines up with the shape.'),
+    row('Zoom', 'fov', -20, 20, 0.5, '°'), row('Left/right', 'yaw', -10, 10, 0.25, '°'), row('Up/down', 'pitch', -10, 10, 0.25, '°'), row('Tilt', 'roll', -10, 10, 0.25, '°'),
+    row('Shift X', 'x', -0.15, 0.15, 0.005, 'cm', 100), row('Shift Y', 'y', -0.15, 0.15, 0.005, 'cm', 100), row('Shift Z', 'z', -0.15, 0.15, 0.005, 'cm', 100),
+    h('div', { class: 'row', style: 'margin-top:6px' },
+      h('button', { class: 'primary', onclick: () => saveAlign(room) }, '💾 Save alignment'),
+      h('button', { onclick: () => { Object.keys(a).forEach((k) => (a[k] = 0)); queueRealign(room); renderSide(); } }, 'Reset')));
 }
 async function saveLayout() {
   try { await api('PATCH', '/api/houses/' + S.house.id, { rooms: S.house.rooms.map((r) => ({ id: r.id, transform: r.transform })) }); S.layoutDirty = false; renderSide(); toast('Layout saved'); } catch (e) { toast(e.message); }
 }
 async function renameRoom(room) {
   const name = prompt('Room name', room.name); if (!name) return;
-  try { Object.assign(room, await api('PATCH', `/api/houses/${S.house.id}/rooms/${room.id}`, { name })); rebuildRoom(room); renderSide(); } catch (e) { toast(e.message); }
+  try { Object.assign(room, await api('PATCH', `/api/houses/${S.house.id}/rooms/${room.id}`, { name })); refreshFurniture(room); renderSide(); } catch (e) { toast(e.message); }
 }
 async function deleteRoom(room) {
   if (!confirm(`Delete ${room.name}?`)) return;
   try { await api('DELETE', `/api/houses/${S.house.id}/rooms/${room.id}`); } catch (e) { return toast(e.message); }
   S.house.rooms = S.house.rooms.filter((r) => r !== room);
   const g = roomGroups.get(room.id); if (g) { houseRoot.remove(g); disposeTree(g); roomGroups.delete(room.id); }
+  atlasCache.get(room.id)?.tex.dispose(); atlasCache.delete(room.id); photoCache.delete(room.id);
   S.roomId = S.house.rooms[0]?.id || null; applyVisibility(); renderSide();
 }
 async function detectRoom(room) {
   toast('🤖 Claude is looking at the room…', 120000);
   try {
     const upd = await api('POST', `/api/houses/${S.house.id}/rooms/${room.id}/detect`, {}, true);
-    const mesh = room.mesh; Object.assign(room, upd); room.mesh = mesh;
-    rebuildRoom(room); renderSide();
+    Object.assign(room, upd);
+    refreshFurniture(room); renderSide();
     toast(`🤖 ${room.name}: ${room.objects.length} items — ${room.objects.slice(0, 5).map((o) => o.name).join(', ')}`, 7000);
   } catch (e) { toast('Claude: ' + e.message, 7000); }
 }
@@ -688,16 +929,39 @@ function onXREnd() {
 }
 $('#btnWalkVR').onclick = () => startXR('walk');
 $('#btnScan').onclick = () => $('#scanDlg').showModal();
-$('#btnCancelScan').onclick = () => $('#scanDlg').close();
-$('#btnStartScan').onclick = () => { $('#scanDlg').close(); startXR('scan'); };
-$('#btnCam').onclick = async () => {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } }, audio: false });
-    const v = h('video', { muted: true, playsInline: true, autoplay: true, style: 'position:fixed;width:2px;height:2px;opacity:0;pointer-events:none' });
-    v.srcObject = stream; document.body.append(v); await v.play();
-    S.camStream = stream; S.camVideo = v; $('#btnCam').textContent = '✅ Camera ready'; $('#btnCam').disabled = true;
-  } catch (e) { toast('Camera not available: ' + e.message + ' — Claude will use the 3D scan only.', 6000); }
+$('#btnCancelScan').onclick = () => { stopCamera(); $('#scanDlg').close(); };
+$('#btnStartScan').onclick = () => {
+  $('#scanDlg').close();
+  if (S.camStream) { camVideo.className = 'camhidden'; document.body.append(camVideo); } // keep frames flowing while in VR
+  startXR('scan');
 };
+
+// ---------- headset camera (real photos of the room) ----------
+const camVideo = h('video', { muted: true, playsInline: true, autoplay: true, className: 'campreview' });
+$('#camBox').prepend(camVideo);
+function stopCamera() {
+  S.camStream?.getTracks().forEach((t) => t.stop()); S.camStream = null; S.camVideo = null; camVideo.srcObject = null;
+  camVideo.className = 'campreview'; $('#camBox').prepend(camVideo); $('#camBox').hidden = true; $('#btnCam').textContent = '📷 Use headset camera';
+}
+async function openCamera(deviceId) {
+  S.camStream?.getTracks().forEach((t) => t.stop());
+  const size = { width: { ideal: 1280 }, height: { ideal: 960 } };
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: deviceId ? { deviceId: { exact: deviceId }, ...size } : { facingMode: 'environment', ...size } });
+  camVideo.srcObject = stream; await camVideo.play().catch(() => {});
+  S.camStream = stream; S.camVideo = camVideo;
+  const current = stream.getVideoTracks()[0]?.getSettings().deviceId;
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
+  if (!deviceId) { // prefer the real passthrough camera over virtual/avatar cameras
+    const real = cams.find((d) => /passthrough|headset|left|back|rear|world/i.test(d.label) && !/virtual|avatar|front|user/i.test(d.label));
+    if (real && real.deviceId !== current) return openCamera(real.deviceId);
+  }
+  const sel = $('#camSelect');
+  sel.replaceChildren(...cams.map((d, i) => h('option', { value: d.deviceId, selected: d.deviceId === current }, d.label || `Camera ${i + 1}`)));
+  sel.hidden = cams.length < 2;
+  $('#camBox').hidden = false; $('#btnCam').textContent = '✅ Camera on';
+}
+$('#btnCam').onclick = () => openCamera().catch((e) => toast('Camera not available: ' + e.message + '. Scan still works, but rooms will be grey.', 7000));
+$('#camSelect').onchange = (e) => openCamera(e.target.value).catch((er) => toast(er.message));
 
 // ---------- XR: scanning ----------
 const SCAN_MAT = {
@@ -708,25 +972,50 @@ const PLANE_COLORS = { wall: 0x60a5fa, floor: 0x34d399, ceiling: 0xa78bfa, door:
 const isStructural = (l) => !l || /global|floor|ceiling|door|window|invisible/i.test(l) || (/wall/i.test(l) && !/art/i.test(l));
 const flatF32 = (v) => (v instanceof Float32Array ? new Float32Array(v) : Float32Array.from(Array.from(v).flatMap((p) => (p.length !== undefined ? Array.from(p) : [p.x, p.y, p.z]))));
 
+const MAXP = 36;
 function initScan() {
-  S.scan = { meshes: new Map(), planes: new Map(), photos: [], tracing: false, trace: [], traceGroup: new THREE.Group(), tracedPlanes: [], status: '', savedAny: false, saving: false, t0: performance.now(), roomSetupTried: false };
+  S.scan = { meshes: new Map(), planes: new Map(), photos: [], tracing: false, trace: [], traceGroup: new THREE.Group(), tracedPlanes: [], status: '', savedAny: false, saving: false, t0: performance.now(), roomSetupTried: false, hist: [], auto: true, lastShot: 0, flash: 0 };
   scanRoot.add(S.scan.traceGroup);
 }
 function endScan() {
   disposeTree(scanRoot); scanRoot.clear();
-  if (S.camStream) { S.camStream.getTracks().forEach((t) => t.stop()); S.camVideo?.remove(); S.camStream = null; S.camVideo = null; $('#btnCam').textContent = '📷 Enable headset camera'; $('#btnCam').disabled = false; }
+  stopCamera();
   S.scan = null;
 }
 function makeScanHud() {
   const sc = () => S.scan;
-  return makeHud([
-    { label: '📸 Photo', onClick: snapPhoto, enabled: () => !!S.camVideo },
+  const hud = makeHud([
+    { label: '📸 Photo', onClick: () => snapPhoto(false), enabled: () => !!S.camVideo },
+    { label: () => `Auto photos: ${sc()?.auto ? 'on' : 'off'}`, onClick: () => (sc().auto = !sc().auto), enabled: () => !!S.camVideo },
     { label: '🧭 Room setup', onClick: roomSetup },
     { label: () => (sc()?.tracing ? '✔ Finish trace' : '✏️ Trace floor'), onClick: () => (sc().tracing ? finishTrace() : startTrace()) },
     { label: '↶ Undo point', onClick: undoTrace, enabled: () => !!sc()?.tracing && sc().trace.length > 0 },
     { label: '💾 Save room', onClick: saveScan, enabled: () => !sc()?.saving },
     { label: '✖ Exit', onClick: () => renderer.xr.getSession()?.end() },
   ]);
+  const thumb = canvasPlane(0.16, 0.12); thumb.position.set(0.42, 0.15, 0); hud.add(thumb); hud.userData.thumb = thumb; // live camera view
+  return hud;
+}
+// Take photos by itself whenever you hold your head still and look somewhere new
+function autoCapture(sc) {
+  const now = performance.now();
+  const p = camera.getWorldPosition(new THREE.Vector3()), q = camera.getWorldQuaternion(new THREE.Quaternion());
+  sc.hist.push({ t: now, p, q }); while (sc.hist.length > 2 && now - sc.hist[0].t > 400) sc.hist.shift();
+  const th = hud?.userData.thumb;
+  if (th) {
+    th.visible = !!S.camVideo;
+    if (S.camVideo?.videoWidth && now - (th.userData.t || 0) > 250) {
+      th.userData.t = now; const { ctx, canvas, tex } = th.userData;
+      ctx.drawImage(S.camVideo, 0, 0, canvas.width, canvas.height);
+      if (now - sc.flash < 350) { ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 14; ctx.strokeRect(0, 0, canvas.width, canvas.height); }
+      tex.needsUpdate = true;
+    }
+  }
+  if (!sc.auto || !S.camVideo || sc.saving || sc.photos.length >= MAXP || now - sc.lastShot < 600) return;
+  const old = sc.hist[0]; if (!old || now - old.t < 250) return;
+  if (old.p.distanceTo(p) > 0.015 || old.q.angleTo(q) > deg(1.5)) return; // still moving → wait (sharper photo, exact position)
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
+  if (sc.photos.every((ph) => ph.fwd.angleTo(fwd) > deg(14) || ph.pos.distanceTo(p) > 0.45)) snapPhoto(true);
 }
 async function roomSetup() {
   const s = renderer.xr.getSession(); S.scan.roomSetupTried = true;
@@ -735,6 +1024,7 @@ async function roomSetup() {
 }
 function scanUpdate(frame) {
   const sc = S.scan; if (!frame || !sc) return;
+  autoCapture(sc);
   const ref = renderer.xr.getReferenceSpace();
   const meshes = frame.detectedMeshes, planes = frame.detectedPlanes;
   if (meshes) {
@@ -781,23 +1071,24 @@ function scanUpdate(frame) {
   const hasData = tris > 0 || sc.planes.size > 0 || sc.tracedPlanes.length > 0;
   const waited = performance.now() - sc.t0 > 4000;
   const lines = [
-    `Mesh ${Math.round(tris).toLocaleString()} triangles · ${walls} walls · ${objs} furniture boxes · ${sc.photos.length}/8 photos`,
+    `Mesh ${Math.round(tris).toLocaleString()} triangles · ${walls} walls · ${objs} furniture boxes · 📸 ${sc.photos.length}/${MAXP} photos`,
     sc.status || (sc.tracing ? `Tracing: point at each floor corner and pull the trigger / pinch (${sc.trace.length} points). Then Finish trace.`
-      : hasData ? (S.camVideo ? 'Looks good! Look at furniture and press Photo (3–6), then Save room.' : 'Looks good! Press Save room. (Tip: enable the camera before scanning so Claude can see colors.)')
+      : hasData ? (S.camVideo ? (sc.photos.length < 12 ? 'Look slowly at every wall, corner and piece of furniture. Hold still for a moment and a photo is taken by itself.' : 'Great coverage! Grab any spots you missed, then press Save room.') : 'Press Save room. (Tip: turn on the headset camera before scanning so your real walls and furniture show up instead of grey.)')
         : waited ? '⚠ No room data yet. Press Room setup to map this room, or Trace floor.' : 'Loading room data from the headset…'),
   ];
   paintInfo(hud, `Scanning · ${S.house?.name || ''}`, lines);
 }
-function snapPhoto() {
+function snapPhoto(auto = false) {
   const v = S.camVideo, sc = S.scan;
-  if (!v || v.readyState < 2 || !v.videoWidth) { sc.status = '⚠ Camera is not sending images.'; return; }
-  const s = Math.min(1, 1024 / Math.max(v.videoWidth, v.videoHeight));
+  if (!v || v.readyState < 2 || !v.videoWidth) { if (!auto) sc.status = '⚠ Camera is not sending images.'; return; }
+  if (sc.photos.length >= MAXP) { if (!auto) sc.status = `Photo limit (${MAXP}) reached — press Save room.`; return; }
+  const s = Math.min(1, 640 / Math.max(v.videoWidth, v.videoHeight));
   const c = document.createElement('canvas'); c.width = Math.round(v.videoWidth * s); c.height = Math.round(v.videoHeight * s);
   c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
   const p = camera.getWorldPosition(new THREE.Vector3()), q = camera.getWorldQuaternion(new THREE.Quaternion());
-  sc.photos.push({ data: c.toDataURL('image/jpeg', 0.8).split(',')[1], pose: { p: p.toArray(), q: q.toArray() }, hfov: 72, aspect: c.width / c.height });
-  if (sc.photos.length > 8) sc.photos.shift();
-  sc.status = `📸 Photo ${sc.photos.length} saved. Take a few from different corners.`;
+  sc.photos.push({ data: c.toDataURL('image/jpeg', 0.8).split(',')[1], pose: { p: p.toArray(), q: q.toArray() }, hfov: 76, aspect: c.width / c.height, pos: p, fwd: new THREE.Vector3(0, 0, -1).applyQuaternion(q) });
+  sc.lastShot = sc.flash = performance.now();
+  if (!auto) sc.status = '';
 }
 function startTrace() { const sc = S.scan; sc.tracing = true; sc.trace = []; sc.tracedPlanes = []; redrawTrace(); sc.status = ''; }
 function addTracePoint(p) { S.scan.trace.push([p.x, 0, p.z]); redrawTrace(); }
@@ -903,7 +1194,7 @@ function packRoom(raw, n) {
   for (let i = 0; i < pos.length; i += 3) { pos[i] -= cx; pos[i + 2] -= cz; }
   const photos = raw.photos.map((ph) => {
     const p = sh(rot(ph.pose.p)); const q = qR.clone().multiply(new THREE.Quaternion(...ph.pose.q));
-    return { ...ph, pose: { p, q: q.toArray() } };
+    return { data: ph.data, hfov: ph.hfov, aspect: ph.aspect, pose: { p, q: q.toArray() } };
   });
   return {
     name: `Room ${n}`,
@@ -937,7 +1228,8 @@ function makeWalkHud() {
   return makeHud([
     { label: '➡ Next room', onClick: nextRoom, enabled: () => roomGroups.size > 0 },
     { label: () => `Labels: ${S.showLabels ? 'on' : 'off'}`, onClick: () => { S.showLabels = !S.showLabels; applyVisibility(); } },
-    { label: () => `Scan mesh: ${S.showMesh ? 'on' : 'off'}`, onClick: () => { S.showMesh = !S.showMesh; applyVisibility(); } },
+    { label: () => `Photos: ${S.showPhotos ? 'on' : 'off'}`, onClick: () => { S.showPhotos = !S.showPhotos; applyVisibility(); } },
+    { label: () => `Boxes: ${S.showBoxes ? 'on' : 'off'}`, onClick: () => { S.showBoxes = !S.showBoxes; applyVisibility(); } },
     { label: () => `Models: ${S.showModels ? 'on' : 'off'}`, onClick: () => { S.showModels = !S.showModels; applyVisibility(); } },
     { label: '▾ Hide menu', onClick: () => setMini(hud, true) },
     { label: '✖ Exit', onClick: () => renderer.xr.getSession()?.end() },
@@ -997,6 +1289,10 @@ renderer.setAnimationLoop((t, frame) => {
   } else {
     if ($('#house').hidden) return;
     if (S.view === 'walk') desktopWalk(dt); else controls.update();
+  }
+  if (activeScene === houseScene) {
+    const cw = camera.getWorldPosition(_v2);
+    for (const g of roomGroups.values()) g.worldToLocal(g.userData.parts.mat.uniforms.camLocal.value.copy(cw));
   }
   renderer.render(activeScene, camera);
 });
